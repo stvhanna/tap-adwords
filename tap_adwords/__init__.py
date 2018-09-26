@@ -16,9 +16,10 @@ from googleads import adwords
 from googleads import oauth2
 
 import requests
-import singer.metrics as metrics
-import singer.bookmarks as bookmarks
 import singer
+import zeep
+from singer import metrics
+from singer import bookmarks
 from singer import utils
 from singer import metadata
 from singer import (transform,
@@ -31,7 +32,7 @@ LOGGER = singer.get_logger()
 SESSION = requests.Session()
 
 PAGE_SIZE = 1000
-VERSION = 'v201802'
+VERSION = 'v201806'
 
 REPORT_TYPE_MAPPINGS = {"Boolean":  {"type": ["null", "boolean"]},
                         "boolean":  {'type': ["null", "boolean"]},
@@ -58,7 +59,7 @@ GENERIC_ENDPOINT_MAPPINGS = {"campaigns": {'primary_keys': ["id"],
 REPORT_RUN_DATETIME = utils.strftime(utils.now())
 
 VERIFIED_REPORTS = frozenset([
-    # 'ACCOUNT_PERFORMANCE_REPORT',
+    'ACCOUNT_PERFORMANCE_REPORT',
     'ADGROUP_PERFORMANCE_REPORT',
     # 'AD_CUSTOMIZERS_FEED_ITEM_REPORT',
     'AD_PERFORMANCE_REPORT',
@@ -67,7 +68,7 @@ VERIFIED_REPORTS = frozenset([
     # 'AUTOMATIC_PLACEMENTS_PERFORMANCE_REPORT',
     # 'BID_GOAL_PERFORMANCE_REPORT',
     #'BUDGET_PERFORMANCE_REPORT',                       -- does NOT allow for querying by date range
-    # 'CALL_METRICS_CALL_DETAILS_REPORT',
+    'CALL_METRICS_CALL_DETAILS_REPORT',
     #'CAMPAIGN_AD_SCHEDULE_TARGET_REPORT',
     #'CAMPAIGN_CRITERIA_REPORT',
     #'CAMPAIGN_GROUP_PERFORMANCE_REPORT',
@@ -81,8 +82,8 @@ VERIFIED_REPORTS = frozenset([
     #'CREATIVE_CONVERSION_REPORT',
     'CRITERIA_PERFORMANCE_REPORT',
     #'DESTINATION_URL_REPORT',
-    #'DISPLAY_KEYWORD_PERFORMANCE_REPORT',
-    #'DISPLAY_TOPICS_PERFORMANCE_REPORT',
+    'DISPLAY_KEYWORD_PERFORMANCE_REPORT',
+    'DISPLAY_TOPICS_PERFORMANCE_REPORT',
     'FINAL_URL_REPORT',
     'GENDER_PERFORMANCE_REPORT',
     'GEO_PERFORMANCE_REPORT',
@@ -92,19 +93,19 @@ VERIFIED_REPORTS = frozenset([
     #'LABEL_REPORT',                                    -- does NOT allow for querying by date range,
     #'PAID_ORGANIC_QUERY_REPORT',
     #'PARENTAL_STATUS_PERFORMANCE_REPORT',
-    #'PLACEHOLDER_FEED_ITEM_REPORT',
-    #'PLACEHOLDER_REPORT',
+    'PLACEHOLDER_FEED_ITEM_REPORT',
+    'PLACEHOLDER_REPORT',
     'PLACEMENT_PERFORMANCE_REPORT',
     #'PRODUCT_PARTITION_REPORT',
     'SEARCH_QUERY_PERFORMANCE_REPORT',
     #'SHARED_SET_CRITERIA_REPORT',                      -- does NOT allow for querying by date range
     #'SHARED_SET_REPORT',                               -- does NOT allow for querying by date range
     #'SHARED_SET_REPORT',
-    #'SHOPPING_PERFORMANCE_REPORT',
+    'SHOPPING_PERFORMANCE_REPORT',
     #'TOP_CONTENT_PERFORMANCE_REPORT',
     #'URL_PERFORMANCE_REPORT',
     #'USER_AD_DISTANCE_REPORT',
-    #'VIDEO_PERFORMANCE_REPORT',
+    'VIDEO_PERFORMANCE_REPORT',
     #'UNKNOWN'
 ])
 
@@ -133,6 +134,12 @@ def load_schema(entity):
 
 def load_metadata(entity):
     return utils.load_json(get_abs_path("metadata/{}.json".format(entity)))
+
+def get_attribution_window_bookmark(customer_id, stream_name):
+    mid_bk_value = bookmarks.get_bookmark(STATE,
+                                          state_key_name(customer_id, stream_name),
+                                          'last_attribution_window_date')
+    return utils.strptime_with_tz(mid_bk_value) if mid_bk_value else None
 
 def get_start_for_stream(customer_id, stream_name):
     bk_value = bookmarks.get_bookmark(STATE,
@@ -206,7 +213,11 @@ def sync_report(stream_name, stream_metadata, sdk_client):
         field_list.append(stream_metadata[('properties', field)]['adwords.fieldName'])
 
     check_selected_fields(stream_name, field_list, sdk_client)
-    start_date = apply_conversion_window(get_start_for_stream(customer_id, stream_name))
+    # If an attribution window sync is interrupted, start where it left off
+    start_date = get_attribution_window_bookmark(customer_id, stream_name)
+    if start_date is None:
+        start_date = apply_conversion_window(get_start_for_stream(customer_id, stream_name))
+
     if stream_name in REPORTS_WITH_90_DAY_MAX:
         cutoff = utils.now()+relativedelta(days=-90)
         if start_date < cutoff:
@@ -217,6 +228,15 @@ def sync_report(stream_name, stream_metadata, sdk_client):
     while start_date <= get_end_date():
         sync_report_for_day(stream_name, stream_schema, sdk_client, start_date, field_list)
         start_date = start_date+relativedelta(days=1)
+        bookmarks.write_bookmark(STATE,
+                                 state_key_name(customer_id, stream_name),
+                                 'last_attribution_window_date',
+                                 start_date.strftime(utils.DATETIME_FMT))
+        singer.write_state(STATE)
+    bookmarks.clear_bookmark(STATE,
+                             state_key_name(customer_id, stream_name),
+                             'last_attribution_window_date')
+    singer.write_state(STATE)
     LOGGER.info("Done syncing the %s report for customer_id %s", stream_name, customer_id)
 
 def parse_csv_stream(csv_stream):
@@ -241,7 +261,9 @@ def get_xml_attribute_headers(stream_schema, description_headers):
     return xml_attribute_headers
 
 def transform_pre_hook(data, typ, schema): # pylint: disable=unused-argument
-    if isinstance(data, str) and '--' in data:
+    # A value of two dashes (--) indicates there is no value
+    # See https://developers.google.com/adwords/api/docs/guides/reporting#two_dashes
+    if isinstance(data, str) and data.strip() == '--':
         data = None
 
     elif data and typ == "number":
@@ -255,6 +277,8 @@ def transform_pre_hook(data, typ, schema): # pylint: disable=unused-argument
             data = data[:-2]
 
         data = data.replace('%', '')
+    elif data and typ == 'object':
+        data = zeep.helpers.serialize_object(data, target_cls=dict)
 
     return data
 
@@ -326,6 +350,7 @@ def sync_report_for_day(stream_name, stream_schema, sdk_client, start, field_lis
             obj = dict(zip(get_xml_attribute_headers(stream_schema, headers), row))
             obj['_sdc_customer_id'] = customer_id
             obj['_sdc_report_datetime'] = REPORT_RUN_DATETIME
+
             with Transformer(singer.UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
                 bumble_bee.pre_hook = transform_pre_hook
                 obj = bumble_bee.transform(obj, stream_schema)
@@ -345,21 +370,6 @@ def sync_report_for_day(stream_name, stream_schema, sdk_client, start, field_lis
 
         LOGGER.info("Done syncing %s records for the %s report for customer_id %s on %s",
                     counter.value, stream_name, customer_id, start)
-
-def suds_to_dict(obj):
-    if not hasattr(obj, '__keylist__'):
-        return obj
-    data = {}
-    fields = obj.__keylist__
-    for field in fields:
-        val = getattr(obj, field)
-        if isinstance(val, list):
-            data[field] = []
-            for item in val:
-                data[field].append(suds_to_dict(item))
-        else:
-            data[field] = suds_to_dict(val)
-    return data
 
 CAMPAIGNS_BLACK_LISTED_FIELDS = set(['networkSetting', 'conversionOptimizerEligibility',
                                      'frequencyCap'])
@@ -652,8 +662,7 @@ def sync_campaign_ids_endpoint(sdk_client,
                 with metrics.record_counter(stream) as counter:
                     time_extracted = utils.now()
 
-                    for entry in page['entries']:
-                        obj = suds_to_dict(entry)
+                    for obj in page['entries']:
                         obj['_sdc_customer_id'] = sdk_client.client_customer_id
                         with Transformer(singer.UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
                             bumble_bee.pre_hook = transform_pre_hook
@@ -709,8 +718,7 @@ def sync_generic_basic_endpoint(sdk_client, stream, stream_metadata):
             with metrics.record_counter(stream) as counter:
                 time_extracted = utils.now()
 
-                for entry in page['entries']:
-                    obj = suds_to_dict(entry)
+                for obj in page['entries']:
                     obj['_sdc_customer_id'] = sdk_client.client_customer_id
                     with Transformer(singer.UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING) as bumble_bee:
                         bumble_bee.pre_hook = transform_pre_hook
@@ -725,7 +733,7 @@ def sync_generic_basic_endpoint(sdk_client, stream, stream_metadata):
     LOGGER.info("Done syncing %s for customer_id %s", stream, sdk_client.client_customer_id)
 
 def sync_generic_endpoint(stream_name, stream_metadata, sdk_client):
-    if stream_name == 'ads' or stream_name == 'ad_groups':
+    if stream_name in ('ads', 'ad_groups'):
         selector = {
             'fields': ['Id'],
             'paging': {
@@ -743,7 +751,7 @@ def sync_generic_endpoint(stream_name, stream_metadata, sdk_client):
                                    campaign_ids,
                                    stream_name,
                                    stream_metadata)
-    elif stream_name == 'campaigns' or stream_name == 'accounts':
+    elif stream_name in ('campaigns', 'accounts'):
         sync_generic_basic_endpoint(sdk_client,
                                     stream_name,
                                     stream_metadata)
